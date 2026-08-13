@@ -47,13 +47,168 @@ py -m pip install -r requirements.txt
 
 ---
 
+## Workflows
+
+Which workflow do I need?
+
+| Scenario                                                        | Workflow | Tool / command                                   |
+| --------------------------------------------------------------- | -------- | ------------------------------------------------ |
+| Upgrade one UAG to a new version, keep everything as-is          | A        | `uag_wizard.py` (no arguments)                   |
+| Export today, deploy later / on another machine                  | B        | `export` + `uag_wizard.py --settings`            |
+| Scripted / repeatable migration, no interaction                  | C        | `uag_migrate.py migrate`                         |
+| Full control, one step at a time                                 | D        | `export` -> `deploy` -> `import` -> `health`     |
+| Brand-new UAG, no source appliance                               | E        | `uag_deploy.py --ini`                            |
+| Several UAGs behind a load balancer                              | F        | rolling: workflow A/C per node                   |
+| Disaster recovery preparation                                    | G        | scheduled `export` + workflow B when needed      |
+| Fix/replace the configuration of a running appliance             | H        | `import` only                                    |
+
+---
+
+### A. Full interactive 1:1 migration (recommended)
+
+One session, everything discovered and pre-filled, same IP kept -- no load balancer or DNS change needed.
+
+```
+py uag_wizard.py
+```
+
+```
+vCenter login -> pick source VM -> discover (IP/nets/DS/folder) ->
+export config + secrets -> shut down old VM -> pick OVA + cert ->
+confirm pre-filled parameters -> deploy -> import -> services green
+```
+
+Rollback at any point: power the old VM back on (it is never deleted).
+
+---
+
+### B. Deferred restore (export now, deploy later)
+
+Split the migration into two independent sessions -- e.g. export during business hours, deploy in the maintenance window; or export on one workstation and deploy from another.
+
+```
+:: session 1 - export only (prompts for the admin password and for
+::             secrets the export strips; saves them into the JSON)
+py uag_migrate.py export --host uag-old.example.com --out uag_settings.json
+
+:: session 2 - interactive deploy + restore from the JSON
+py uag_wizard.py --settings uag_settings.json
+::   (identical: py uag_migrate.py deploy --settings uag_settings.json)
+```
+
+The restore session asks for vCenter, target cluster/host, OVA, certificate, VM name, IP and passwords -- `uagName` is pre-filled from the JSON. Network settings (IP/mask/gateway/DNS) are not part of a UAG export, so enter them manually. Power off the original appliance first if the new one reuses its IP.
+
+---
+
+### C. One-command non-interactive migration (automation / CI)
+
+The whole chain with a preflight check up front; suitable for scheduled runs.
+
+```
+py uag_migrate.py migrate ^
+    --old-host uag-old.example.com --new-host 10.0.0.51 ^
+    --ini template.ini ^
+    --set General.name=UAG-01-NEW --set General.ip0=10.0.0.51 ^
+    --pfx-password "***" --vcenter-password "***" ^
+    --secrets secrets.json --quiesce-old
+```
+
+```
+preflight -> export -> deploy (ovftool) -> import -> services green -> quiesce old
+```
+
+Preflight verifies ovftool, the OVA, the INI, certificates (incl. PKCS#1) and the old UAG's Admin API before anything is touched; a guard aborts if the new VM name matches the old one.
+
+---
+
+### D. Step-by-step CLI migration (full control)
+
+Same as C, but each stage is a separate command with room for manual checks and JSON edits in between.
+
+```
+py uag_migrate.py export  --host uag-old.example.com --out uag_settings.json
+:: (review/edit uag_settings.json - thumbprints, ciphers, secrets)
+py uag_migrate.py deploy  --ini template.ini --set General.name=UAG-01-NEW
+py uag_migrate.py import  --host 10.0.0.51 --settings uag_settings.json
+py uag_migrate.py health  --host 10.0.0.51
+:: cutover, then:
+py uag_migrate.py quiesce --host uag-old.example.com
+```
+
+`deploy` targets vCenter (creates the VM via ovftool); `import` targets the new UAG appliance itself (REST API on port 9443).
+
+---
+
+### E. Greenfield deployment (no source appliance)
+
+Deploy a brand-new UAG purely from an INI -- the direct equivalent of the official `uagdeploy.ps1`.
+
+```
+py uag_deploy.py --ini uag1.ini --dry-run     # inspect the ovftool command first
+py uag_deploy.py --ini uag1.ini
+```
+
+Put the full configuration into the INI (`[Horizon]`, `[SSLCert]`, ...), or deploy minimal and push a prepared JSON afterwards with `uag_migrate.py import`.
+
+---
+
+### F. Rolling migration behind a load balancer
+
+With multiple UAGs in a pool, migrate one node at a time so capacity never drops to zero:
+
+```
+for each UAG node:
+    1. disable the node on the load balancer (or quiesce it)
+    2. run workflow A (wizard) or C (migrate) for that node
+    3. test a client connection through the new node
+    4. re-enable the node on the load balancer
+    5. verify pool health before starting the next node
+```
+
+One INI template plus `--set General.name=... --set General.ip0=...` per node keeps the fleet consistent.
+
+---
+
+### G. Disaster recovery preparation
+
+Schedule periodic exports; restore on demand with workflow B.
+
+```
+:: scheduled task (secrets prompting disabled for unattended runs)
+py uag_migrate.py export --host uag01.example.com ^
+    --password "***" --out backups\uag01_%DATE%.json --no-secret-prompt
+
+:: DR restore later
+py uag_wizard.py --settings backups\uag01_2026-08-13.json
+```
+
+Keep the matching OVA and certificate with the backups -- neither is part of the export. Secrets are stripped from unattended exports; store them in your password manager or a `--secrets` file.
+
+---
+
+### H. Configuration-only re-import
+
+Push a (fixed) JSON into an already-running appliance -- no deployment involved:
+
+```
+py uag_migrate.py import --host 10.0.0.51 --settings uag_settings.json ^
+    [--secrets secrets.json] [--cert-pem chain.pem --key-pem key_pkcs1.pem]
+```
+
+Useful for repairing a broken config change, syncing a lab appliance with production settings, or completing a migration whose import step failed (e.g. after fixing SHA-1 thumbprints in the JSON).
+
+---
+
 ## `uag_wizard.py` -- Interactive 1:1 migration wizard
 
 Run it with **no arguments** in a real terminal. The wizard walks through the whole migration in eight steps; every value is pre-filled from what it discovers, so a typical run is mostly pressing Enter.
 
 ```
 py uag_wizard.py
+py uag_wizard.py --plain     # classic input() for text prompts (see note below)
 ```
+
+**Alt+numpad characters (e.g. Alt+64 for `@`) work in ALL inputs.** Text prompts and passwords run in the console's cooked mode (`input()` / `getpass`), where conhost handles Alt+numpad composition -- unlike prompt_toolkit, which discards it. Defaults are still pre-filled as **editable** text: on Windows the default is injected into the console input buffer via `WriteConsoleInputW`, on Linux via `readline.insert_text`, so you can edit it with Backspace as before. Arrow-key *selection* lists (VM, OVA, certificate, port groups, datastore) remain unchanged -- they only need arrows and Enter. `--plain` disables the pre-fill injection and shows defaults in `[brackets]` instead (Enter accepts); Alt codes work in both modes.
 
 **Workflow:**
 
@@ -92,6 +247,15 @@ py uag_wizard.py
 - Root and admin passwords are validated against the UAG password policy (min 8 chars, upper + lower + digit + special) before the deployment starts.
 - If the new VM name equals the source VM name, the wizard warns that `ovftool --overwrite` would **delete** the old VM and asks for explicit confirmation.
 - On any failure after the source VM was powered off, roll back by simply powering the old VM back on -- it is never modified.
+
+**Restore mode (`--settings`):** deploy a new appliance from an existing migration JSON without touching any source VM -- useful for re-deployments, DR restores, or when the export was done earlier with `uag_migrate.py export`:
+
+```
+py uag_wizard.py --settings uag_settings.json
+py uag_migrate.py deploy --settings uag_settings.json     # same thing
+```
+
+The wizard then runs a shortened flow: connect to vCenter -> load and validate the JSON (prompting for any secrets the export stripped, saving them back into the file) -> pick the target datacenter/cluster/host from an arrow-key list -> pick the OVA and certificate -> answer the deployment questions (uagName pre-filled from the JSON; IP/network/datastore chosen from the target host's inventory) -> deploy, re-read the JSON from disk, import, and verify the edge services. Make sure the IP you assign is free -- the original appliance, if any, must be powered off.
 
 **Secrets and files that can never be migrated automatically** (the UAG export does not contain them): appliance root/admin passwords, RADIUS/SAML shared secrets, the TLS server certificate, keytab files. The wizard prompts for all of them except keytabs, which must be re-uploaded in the Admin UI.
 
@@ -149,7 +313,7 @@ Scriptable counterpart of the wizard for automation and CI. Subcommands:
 
 | Subcommand | Purpose                                                             |
 | ---------- | ------------------------------------------------------------------- |
-| `export`   | Download the configuration from the old UAG (JSON), report missing secrets |
+| `export`   | Download the configuration from the old UAG (JSON); detects services whose secrets are stripped from the export and prompts for them interactively, saving them into the JSON (`--no-secret-prompt` disables) |
 | `deploy`   | Deploy a new UAG from an INI (with preflight check)                 |
 | `import`   | Import the JSON into the new UAG, patch secrets, upload the TLS cert |
 | `health`   | Print `/monitor/stats` and a clear `Green: YES/NO` verdict          |

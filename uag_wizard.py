@@ -72,7 +72,7 @@ except ImportError:
     _MISSING.append("pyvmomi")
 
 try:
-    from uag_api import UagClient, UagApiError
+    from uag_api import UagClient, UagApiError, describe_error
     import uag_deploy
 except ImportError as e:
     print(f"Error: cannot import companion module ({e}). "
@@ -110,11 +110,144 @@ def fail(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-def ask_text(message: str, default: str = "", validate=None) -> str:
-    a = questionary.text(message, default=default, validate=validate).ask()
-    if a is None:
+# Text input mode. All text prompts use the console's cooked mode
+# (classic input()), where characters composed with Alt+numpad
+# (e.g. Alt+64 for @) work - unlike prompt_toolkit, which discards
+# them on Windows. Defaults are pre-filled as EDITABLE text by
+# injecting them into the console input buffer (WriteConsoleInputW on
+# Windows, readline.insert_text on POSIX). --plain disables the
+# injection and shows defaults in [brackets] instead (Enter accepts).
+PLAIN_INPUT = False
+
+
+def _inject_console_text(text: str) -> bool:
+    """Windows: push `text` into the console input buffer so the next
+    input() call shows it as editable pre-filled content."""
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        class KEY_EVENT_RECORD(ctypes.Structure):
+            _fields_ = [("bKeyDown", wt.BOOL), ("wRepeatCount", wt.WORD),
+                        ("wVirtualKeyCode", wt.WORD),
+                        ("wVirtualScanCode", wt.WORD),
+                        ("UnicodeChar", wt.WCHAR),
+                        ("dwControlKeyState", wt.DWORD)]
+
+        class _EVENT(ctypes.Union):
+            _fields_ = [("KeyEvent", KEY_EVENT_RECORD)]
+
+        class INPUT_RECORD(ctypes.Structure):
+            _fields_ = [("EventType", wt.WORD), ("Event", _EVENT)]
+
+        handle = ctypes.windll.kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        records = (INPUT_RECORD * len(text))()
+        for i, ch in enumerate(text):
+            records[i].EventType = 0x0001  # KEY_EVENT
+            ke = records[i].Event.KeyEvent
+            ke.bKeyDown = True
+            ke.wRepeatCount = 1
+            ke.UnicodeChar = ch
+        written = wt.DWORD(0)
+        ok = ctypes.windll.kernel32.WriteConsoleInputW(
+            handle, records, len(text), ctypes.byref(written))
+        return bool(ok) and written.value == len(text)
+    except Exception:
+        return False
+
+
+# Colour of the text the user types / edits (matches the questionary look
+# the selection lists still use).
+INPUT_COLOR = None   # resolved lazily so the colorama fallback works
+
+
+def _wrap_invisible(seq: str) -> str:
+    """On POSIX, wrap zero-width ANSI sequences in \\001..\\002 so readline
+    does not count them into the cursor position. Windows (no readline)
+    takes them raw."""
+    if not seq:
+        return ""
+    if sys.platform == "win32":
+        return seq
+    return "\001" + seq + "\002"
+
+
+# Colour of the values the user types / edits - matches the gold/amber
+# answer colour questionary uses for its own prompts (e.g. the 'No' after
+# a confirm question). Change here to restyle all inputs at once.
+INPUT_STYLE = Style.BRIGHT + Fore.YELLOW
+
+
+def _colored_prompt(message: str, suffix: str = "") -> str:
+    """'[?] message: ' with a green question mark in brackets (matching the
+    [i]/[!]/[OK] markers); ends with the colour that the user's typed
+    (or pre-filled) text is rendered in."""
+    message = message.rstrip().rstrip(":")   # avoid 'IP::' double colons
+    return ("[" + _wrap_invisible(Style.BRIGHT + Fore.GREEN) + "?"
+            + _wrap_invisible(Style.RESET_ALL) + "]"
+            + f" {message}{suffix}: "
+            + _wrap_invisible(INPUT_STYLE))
+
+
+def _marker() -> str:
+    """Plain (non-readline) coloured '[?]' for getpass/masked prompts."""
+    return f"[{Style.BRIGHT}{Fore.GREEN}?{Style.RESET_ALL}]"
+
+
+def _reset_color() -> None:
+    try:
+        sys.stdout.write(Style.RESET_ALL)
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def _edit_input(message: str, default: str) -> str:
+    """Cooked-mode input with an editable pre-filled default. The prompt is
+    coloured and the text being typed/edited is rendered in cyan."""
+    if default and not PLAIN_INPUT:
+        if sys.platform == "win32":
+            if _inject_console_text(default):
+                try:
+                    return input(_colored_prompt(message))
+                except EOFError:
+                    fail("Aborted by user.", 130)
+                finally:
+                    _reset_color()
+        else:
+            try:
+                import readline
+                readline.set_startup_hook(
+                    lambda: readline.insert_text(default))
+                try:
+                    return input(_colored_prompt(message))
+                except EOFError:
+                    fail("Aborted by user.", 130)
+                finally:
+                    readline.set_startup_hook(None)
+                    _reset_color()
+            except ImportError:
+                pass
+    # fallback / --plain: show the default in brackets, Enter accepts it
+    suffix = f" [{default}]" if default else ""
+    try:
+        a = input(_colored_prompt(message, suffix))
+    except EOFError:
         fail("Aborted by user.", 130)
-    return a.strip()
+    finally:
+        _reset_color()
+    return a if a.strip() else default
+
+
+def ask_text(message: str, default: str = "", validate=None) -> str:
+    while True:
+        a = _edit_input(message, default).strip()
+        if validate:
+            v = validate(a)
+            if v is not True:
+                warn(v if isinstance(v, str) else "Invalid value, try again.")
+                continue
+        return a
 
 
 def uag_password_issues(pwd: str) -> list[str]:
@@ -134,11 +267,90 @@ def uag_password_issues(pwd: str) -> list[str]:
     return issues
 
 
+def _masked_input(prompt: str) -> str:
+    """
+    Password input that echoes '*' for every character. Reads the console
+    character by character (msvcrt.getwch on Windows, raw termios on
+    POSIX), so Alt+numpad composed characters (e.g. Alt+64 for @) work.
+    Backspace erases; Enter confirms. Falls back to getpass when stdin
+    is not a real terminal.
+    """
+    if not sys.stdin.isatty():
+        return getpass.getpass(prompt)
+    sys.stdout.write(prompt + INPUT_STYLE)
+    sys.stdout.flush()
+    buf: list[str] = []
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            while True:
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    break
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x00", "\xe0"):        # arrows / F-keys prefix
+                    msvcrt.getwch()               # swallow the second code
+                    continue
+                if ch == "\x08":                  # backspace
+                    if buf:
+                        buf.pop()
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                    continue
+                if ch < " ":                      # other control chars
+                    continue
+                buf.append(ch)
+                sys.stdout.write("*")
+                sys.stdout.flush()
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while True:
+                    ch = sys.stdin.read(1)
+                    if ch in ("\r", "\n"):
+                        break
+                    if ch == "\x03":
+                        raise KeyboardInterrupt
+                    if ch in ("\x7f", "\x08"):    # backspace
+                        if buf:
+                            buf.pop()
+                            sys.stdout.write("\b \b")
+                            sys.stdout.flush()
+                        continue
+                    if ch == "\x1b":              # swallow escape sequences
+                        sys.stdin.read(1)
+                        sys.stdin.read(1)
+                        continue
+                    if ch < " ":
+                        continue
+                    buf.append(ch)
+                    sys.stdout.write("*")
+                    sys.stdout.flush()
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    finally:
+        sys.stdout.write(Style.RESET_ALL + "\n")
+        sys.stdout.flush()
+    return "".join(buf)
+
+
 def ask_password(message: str, confirm: bool = False,
                  policy: bool = False) -> str:
+    """
+    Password input with '*' masking. Character-by-character console reads
+    (NOT questionary/prompt_toolkit), so Alt+numpad characters
+    (e.g. Alt+64 for @) work on Windows.
+    """
+    message = message.rstrip().rstrip(":")
     while True:
-        a = questionary.password(message).ask()
-        if a is None:
+        try:
+            a = _masked_input(f"{_marker()} {message}: ")
+        except EOFError:
             fail("Aborted by user.", 130)
         if policy:
             issues = uag_password_issues(a)
@@ -148,8 +360,9 @@ def ask_password(message: str, confirm: bool = False,
                 continue
         if not confirm:
             return a
-        b = questionary.password("Confirm password:").ask()
-        if b is None:
+        try:
+            b = _masked_input(f"{_marker()} Confirm password: ")
+        except EOFError:
             fail("Aborted by user.", 130)
         if a == b:
             return a
@@ -204,6 +417,32 @@ class VCenter:
         vms = list(view.view)
         view.Destroy()
         return vms
+
+    def list_hosts(self) -> list:
+        """All ESXi hosts in the inventory (for restore mode, where there is
+        no source VM to derive the placement from)."""
+        view = self.content.viewManager.CreateContainerView(
+            self.content.rootFolder, [vim.HostSystem], True)
+        hosts = list(view.view)
+        view.Destroy()
+        return hosts
+
+    @staticmethod
+    def host_placement(host) -> dict:
+        """Placement info derived from a host (same shape as vm_placement)."""
+        cluster = host.parent if isinstance(host.parent,
+                                            vim.ClusterComputeResource) else None
+        node = host.parent
+        while node and not isinstance(node, vim.Datacenter):
+            node = node.parent
+        return {
+            "datacenter": node.name if node else "",
+            "cluster": cluster.name if cluster else "",
+            "host": host.name,
+            "vm_datastores": [],
+            "host_datastores": sorted(d.name for d in host.datastore),
+            "host_networks": sorted(n.name for n in host.network),
+        }
 
     # ---------- discovery ---------------------------------------------------
 
@@ -386,7 +625,7 @@ def step_vcenter() -> VCenter:
             ok(f"Connected: {about.fullName}")
             return vc
         except Exception as e:
-            warn(f"Connection failed: {e}")
+            warn(f"Connection failed: {describe_error(e)}")
             if not ask_confirm("Try again?", default=True):
                 fail("Cannot continue without vCenter.", 2)
 
@@ -461,7 +700,7 @@ def step_export_config(mgmt_ip: str, vm_name: str) -> tuple[dict, Path, str]:
                 continue
             fail(f"Export failed: {e}", 3)
         except Exception as e:
-            fail(f"Cannot reach the UAG Admin API on {mgmt_ip}:9443 ({e}).", 3)
+            fail(f"Cannot reach the UAG Admin API on {mgmt_ip}:9443 ({describe_error(e)}).", 3)
 
     out = SCRIPT_DIR / f"uag_settings_{vm_name}_{datetime.now():%Y%m%d_%H%M%S}.json"
     out.write_text(json.dumps(settings, indent=2), encoding="utf-8")
@@ -474,8 +713,8 @@ def step_export_config(mgmt_ip: str, vm_name: str) -> tuple[dict, Path, str]:
              "so the import restores a complete configuration:")
         entered = 0
         for key_path in missing:
-            val = questionary.password(f"  value for {key_path} "
-                                       f"(Enter = leave empty):").ask()
+            val = _masked_input(f"  {_marker()} value for {key_path} "
+                                f"(Enter = leave empty): ")
             if val:
                 set_by_path(settings, key_path, val)
                 entered += 1
@@ -866,19 +1105,130 @@ def step_deploy_and_restore(cp: configparser.ConfigParser, artifacts: dict,
 
 
 # ---------------------------------------------------------------------------
+# Restore mode (--settings): deploy a new appliance from an existing
+# migration JSON without touching any source VM
+# ---------------------------------------------------------------------------
+
+def step_load_settings(path: Path) -> dict:
+    hdr("2/6", "Load the migration JSON")
+    while True:
+        try:
+            settings = json.loads(path.read_text(encoding="utf-8-sig"))
+            break
+        except FileNotFoundError:
+            fail(f"Settings file not found: {path}", 2)
+        except json.JSONDecodeError as e:
+            warn(f"{path.name} is not valid JSON: {e}")
+            if not ask_confirm("Fix the file and retry?", default=True):
+                fail("Aborted by user.", 130)
+    uag_name = (settings.get("systemSettings") or {}).get("uagName", "")
+    svc_count = len(((settings.get("edgeServiceSettingsList") or {})
+                     .get("edgeServiceSettingsList")) or [])
+    ok(f"Loaded {path.name}  (uagName: {uag_name or '-'}, "
+       f"edge services: {svc_count})")
+
+    # the export never contains secrets - offer to enter them now
+    missing = find_missing_secrets(settings)
+    if missing:
+        warn("The JSON contains services whose secrets are empty (the UAG "
+             "export never includes them). Enter them now (Enter = skip):")
+        entered = 0
+        for key_path in missing:
+            val = _masked_input(f"  {_marker()} value for {key_path}: ")
+            if val:
+                set_by_path(settings, key_path, val)
+                entered += 1
+        if entered:
+            path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            warn(f"{path.name} now contains the secrets you entered - "
+                 f"delete the file after the migration.")
+    return settings
+
+
+def step_pick_target(vc: VCenter) -> dict:
+    hdr("3/6", "Select the deployment target (cluster / host)")
+    hosts = vc.list_hosts()
+    if not hosts:
+        fail("No ESXi hosts found in this vCenter.", 2)
+    choices = []
+    for h in sorted(hosts, key=lambda x: x.name.lower()):
+        pl = VCenter.host_placement(h)
+        label = (f"{pl['datacenter']} / "
+                 f"{pl['cluster'] + ' / ' if pl['cluster'] else ''}{pl['host']}")
+        choices.append(Choice(title=label, value=h))
+    host = ask_select("Target host (arrow keys, Enter to confirm):", choices)
+    pl = VCenter.host_placement(host)
+    ok(f"Target: datacenter '{pl['datacenter']}', "
+       f"cluster '{pl['cluster'] or '-'}', host '{pl['host']}'")
+    return pl
+
+
+def run_restore_mode(settings_path: Path) -> int:
+    print("  Restore mode: deploying a new appliance from an existing")
+    print("  migration JSON - no source VM is touched.")
+    warn("Make sure the IP address you assign is free (the original "
+         "appliance, if any, must be powered off).")
+
+    vc = step_vcenter()
+    try:
+        settings = step_load_settings(settings_path)
+        placement = step_pick_target(vc)
+        artifacts = step_pick_artifacts()
+
+        uag_name = (settings.get("systemSettings") or {}).get("uagName", "")
+        disco = {
+            "name": uag_name or settings_path.stem,
+            "primary_ip": "",
+            "nics": [],
+            "ipstack": {"gateway": "", "v6gateway": "", "dns": [], "search": []},
+            "placement": placement,
+            "folder": "",
+        }
+        params = step_deploy_params(vc, disco, artifacts, settings)
+        cp = build_ini(disco, artifacts, params)
+        return step_deploy_and_restore(cp, artifacts, params, settings_path)
+    finally:
+        vc.disconnect()
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+    global PLAIN_INPUT
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Omnissa UAG 1:1 Migration Wizard (vSphere)")
+    ap.add_argument("--plain", action="store_true",
+                    help="Do not pre-fill text prompts as editable text; "
+                         "show defaults in [brackets] instead (Enter "
+                         "accepts). Alt+numpad characters work in all "
+                         "inputs in both modes.")
+    ap.add_argument("--settings", metavar="FILE", default=None,
+                    help="Restore mode: skip the source-VM steps and deploy "
+                         "a new appliance restoring the configuration from "
+                         "this migration JSON (exported earlier via the "
+                         "wizard or 'uag_migrate.py export').")
+    args = ap.parse_args()
+    PLAIN_INPUT = args.plain
+
     print(f"{Fore.CYAN}{Style.BRIGHT}")
     print("  Omnissa UAG 1:1 Migration Wizard  (vSphere)")
     print(f"  {'-' * 44}{Style.RESET_ALL}")
-    print("  Exports the configuration from an existing UAG, shuts it down,")
-    print("  deploys a new appliance from an OVA in this directory and")
-    print("  restores the configuration - keeping the same IP address.")
+    if not args.settings:
+        print("  Exports the configuration from an existing UAG, shuts it down,")
+        print("  deploys a new appliance from an OVA in this directory and")
+        print("  restores the configuration - keeping the same IP address.")
+    if PLAIN_INPUT:
+        info("Plain input mode: defaults are shown in [brackets]; press "
+             "Enter to accept them.")
 
     if not sys.stdin.isatty():
         fail("This wizard is interactive - run it in a real terminal.", 2)
+
+    if args.settings:
+        return run_restore_mode(Path(args.settings))
 
     vc = step_vcenter()
     try:

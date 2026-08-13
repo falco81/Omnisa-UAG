@@ -32,6 +32,46 @@ class UagApiError(RuntimeError):
         self.body = body
 
 
+# Common network error codes -> English descriptions. Windows localises
+# OSError messages (e.g. WinError 10060 renders in the OS language), so we
+# translate known codes ourselves instead of echoing the localised text.
+_NET_ERRORS = {
+    10060: "connection timed out",
+    10061: "connection refused (port closed / service not listening)",
+    10054: "connection reset by peer",
+    10051: "network unreachable",
+    10065: "host unreachable",
+    11001: "host name not found (DNS)",
+    -2:    "host name not found (DNS)",
+    110:   "connection timed out",
+    111:   "connection refused (port closed / service not listening)",
+    113:   "host unreachable",
+    101:   "network unreachable",
+    104:   "connection reset by peer",
+}
+
+
+def describe_error(e: BaseException) -> str:
+    """English one-liner for an exception; replaces OS-localised messages
+    of known network errors with English text. Walks the cause chain
+    (URLError wraps the underlying socket error)."""
+    seen = set()
+    node: BaseException | None = e
+    while node is not None and id(node) not in seen:
+        seen.add(id(node))
+        code = getattr(node, "winerror", None) or getattr(node, "errno", None)
+        if code in _NET_ERRORS:
+            return f"{_NET_ERRORS[code]} (error {code})"
+        if isinstance(node, TimeoutError):
+            return "connection timed out"
+        reason = getattr(node, "reason", None)   # urllib URLError
+        node = reason if isinstance(reason, BaseException) else \
+            (node.__cause__ or node.__context__)
+    if isinstance(e, UagApiError):
+        return str(e)
+    return f"{type(e).__name__}: {e}"
+
+
 @dataclass
 class UagClient:
     host: str                       # IP/FQDN of the management interface
@@ -163,7 +203,7 @@ class UagClient:
                 log(f"[OK] UAG {self.host} - Admin API is reachable.")
                 return True
             except (UagApiError, urllib.error.URLError, TimeoutError, OSError) as e:
-                log(f"[..] UAG {self.host} not responding yet ({e.__class__.__name__}), waiting {interval_s}s")
+                log(f"[..] UAG {self.host} not responding yet ({describe_error(e)}), waiting {interval_s}s")
                 time.sleep(interval_s)
         return False
 
@@ -179,7 +219,7 @@ class UagClient:
                     return True
                 log(f"[..] Edge services are not green yet, waiting {interval_s}s")
             except Exception as e:
-                log(f"[..] Cannot read the status ({e}), waiting {interval_s}s")
+                log(f"[..] Cannot read the status ({describe_error(e)}), waiting {interval_s}s")
             time.sleep(interval_s)
         return False
 

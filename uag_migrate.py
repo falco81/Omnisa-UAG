@@ -89,11 +89,43 @@ def cmd_export(args) -> int:
 
     missing = find_missing_secrets(settings)
     if missing:
-        print("\n[!] The export does not contain these secrets - supply them for the import:")
+        print("\n[!] The source UAG has services configured whose secrets are "
+              "never included in the export:")
         for m in missing:
             print(f"    - {m}")
+        interactive = sys.stdin.isatty() and not getattr(args, "no_secret_prompt",
+                                                         False)
+        if interactive:
+            print("    Enter them now so the migration JSON restores the "
+                  "complete configuration (Enter = leave empty):")
+            entered = 0
+            for key_path in missing:
+                val = getpass.getpass(f"      value for {key_path}: ")
+                if val:
+                    set_by_path(settings, key_path, val)
+                    entered += 1
+            if entered:
+                save_json(str(out), settings)
+                print(f"[OK] {entered} secret(s) saved into {out.name}.")
+                print(f"[!] {out.name} now contains secrets - delete the file "
+                      f"after the migration.")
+        else:
+            print("    Supply them later via a --secrets file or by editing "
+                  "the JSON before the import.")
     print("[!] The export never contains the TLS certificate or keytabs - have your PEM/PFX/keytab ready.")
     return 0
+
+
+def set_by_path(settings: dict, path: str, value: str) -> None:
+    """Sets a value in the exported JSON by its dotted path with [n] indices
+    (the same paths find_missing_secrets reports)."""
+    import re as _re
+    tokens = _re.findall(r"([^.\[\]]+)|\[(\d+)\]", path)
+    node = settings
+    flat = [t[0] if t[0] else int(t[1]) for t in tokens]
+    for t in flat[:-1]:
+        node = node[t]
+    node[flat[-1]] = value
 
 
 def apply_ini_overrides(ini_path: str, sets: list[str] | None) -> str:
@@ -192,12 +224,30 @@ def preflight(ini_path: str, old_host: str | None, old_client_factory=None,
         try:
             old_client_factory().get_system_health()
         except Exception as e:
-            problems.append(f"Old UAG {old_host} does not respond on the Admin API: {e}")
+            from uag_api import describe_error as _de
+            problems.append(f"Old UAG {old_host} does not respond on the Admin API: {_de(e)}")
 
     return problems
 
 
 def cmd_deploy(args) -> int:
+    # --settings: interactive restore mode - delegate to the wizard, which
+    # asks for vCenter/network/VM name/IP/passwords with pre-filled prompts
+    # and restores the configuration from the given migration JSON.
+    if getattr(args, "settings", None):
+        wizard = Path(__file__).parent / "uag_wizard.py"
+        if not wizard.is_file():
+            print("ERROR: uag_wizard.py is required for --settings restore "
+                  "mode - keep it next to uag_migrate.py.", file=sys.stderr)
+            return 2
+        return subprocess.run(
+            [sys.executable, str(wizard), "--settings", args.settings]
+        ).returncode
+
+    if not args.ini:
+        print("ERROR: either --ini (INI-based deploy) or --settings "
+              "(interactive restore mode) is required.", file=sys.stderr)
+        return 2
     ini = apply_ini_overrides(args.ini, getattr(args, "set", None))
     problems = preflight(ini, None)
     if problems:
@@ -408,10 +458,18 @@ def main() -> int:
     p = sub.add_parser("export", help="Export the configuration from the old UAG")
     common(p)
     p.add_argument("--out", default=None)
+    p.add_argument("--no-secret-prompt", action="store_true",
+                   help="Do not prompt interactively for missing secrets")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("deploy", help="Deploy a new UAG from an INI (with preflight check)")
-    p.add_argument("--ini", required=True)
+    p = sub.add_parser("deploy", help="Deploy a new UAG from an INI (with preflight check) "
+                                      "or interactively from a migration JSON")
+    p.add_argument("--ini", default=None,
+                   help="INI-based non-interactive deploy")
+    p.add_argument("--settings", metavar="FILE", default=None,
+                   help="Interactive restore mode: launches the wizard, which "
+                        "asks for vCenter/network/VM parameters and restores "
+                        "the configuration from this migration JSON")
     p.add_argument("--set", action="append", metavar="Section.key=value",
                    help="Override an INI value, repeatable "
                         "(e.g. --set General.name=UAG-02 --set General.ip0=10.0.0.51)")
