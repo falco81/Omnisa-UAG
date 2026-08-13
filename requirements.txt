@@ -1,0 +1,21 @@
+# UAG Migration Toolkit - Python dependencies
+#
+# Install:
+#   Windows:  py -m pip install -r requirements.txt
+#   Linux:    python3 -m pip install -r requirements.txt
+#
+# Notes:
+# - uag_deploy.py, uag_migrate.py and uag_api.py use ONLY the Python
+#   standard library - the packages below are needed for the interactive
+#   wizard (uag_wizard.py).
+# - Python 3.9+ required.
+
+# vCenter / vSphere API (VM listing, discovery, power operations)
+pyvmomi>=8.0.0
+
+# Interactive CLI prompts - arrow-key selection, text/password inputs
+# (pulls in prompt_toolkit automatically)
+questionary>=2.0.0
+
+# Colored terminal output on Windows 10 cmd / PowerShell
+colorama>=0.4.6

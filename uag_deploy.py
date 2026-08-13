@@ -1,29 +1,29 @@
 #!/usr/bin/env python3
 """
-uag_deploy.py - Python port oficiálního Omnissa uagdeploy.ps1 / uagdeploy.psm1
-(verze 25.12.1.0, vSphere/ovftool varianta).
+uag_deploy.py - Python port of the official Omnissa uagdeploy.ps1 /
+uagdeploy.psm1 (version 25.12.1.0, vSphere/ovftool variant).
 
-Věrně replikuje mechaniku originálu:
-  * settingsJSON se zapisuje do dočasného .cfg souboru (chunky po 65535 zn.,
-    klíče settingsJSON / settingsJSON-0..N, max 16x65535) a předává ovftool
-    přes --configFile - stejně jako originál (žádné dlouhé CLI argumenty).
-  * Přímé OVF properties 1:1 dle uagdeploy.ps1 (--prop:DNS velkými písmeny,
+Faithfully replicates the mechanics of the original:
+  * settingsJSON is written to a temporary .cfg file (65535-char chunks,
+    keys settingsJSON / settingsJSON-0..N, max 16x65535) and passed to
+    ovftool via --configFile - exactly like the original (no long CLI args).
+  * Direct OVF properties 1:1 per uagdeploy.ps1 (--prop:DNS uppercase,
     --prop:forceNetmask{n}, passwordPolicy*, adminPasswordPolicy*, ssh*,
-    ceipEnabled=False jen pokud je vypnuté, dsComplianceOS, routes,
+    ceipEnabled=False only when disabled, dsComplianceOS, routes,
     policyRouteGateway, configURL/configKey, adminCsrSubject/SAN, ...).
-  * Síťové NIC opce dle GetNetOptions (11 kombinací ipMode, výchozí
-    odvození STATICV4/STATICV6/DHCPV4).
-  * deploymentOption default "onenic", aliasy onenic-L -> onenic-large atd.
+  * NIC options per GetNetOptions (11 ipMode combinations, default
+    derivation of STATICV4/STATICV6/DHCPV4).
+  * deploymentOption defaults to "onenic", aliases onenic-L -> onenic-large.
   * [SSLcert]/[SSLcertAdmin]: PEM -> certificateWrapper{,Admin},
-    PFX -> pfxCertStoreWrapper{,Admin} (base64 + heslo + volitelný alias)
-    uvnitř settingsJSON.
-  * [Horizon] -> edge služba VIEW, [WebReverseProxy], [WebReverseProxy1..99]
-    -> WEB_REVERSE_PROXY, [RADIUSAuth] -> radius-auth (prompt na shared
-    secret, který v exportovaném INI nikdy není).
-  * Validace: ds povinné, jméno VM <= 32 znaků, ověření OVA přes
-    ovftool --verifyOnly, kontrola vmdk 'euc-unified-access-gateway'.
+    PFX -> pfxCertStoreWrapper{,Admin} (base64 + password + optional alias)
+    inside settingsJSON.
+  * [Horizon] -> VIEW edge service, [WebReverseProxy], [WebReverseProxy1..99]
+    -> WEB_REVERSE_PROXY, [RADIUSAuth] -> radius-auth (prompts for the
+    shared secret, which is never present in an exported INI).
+  * Validation: ds required, VM name <= 32 chars, OVA verified via
+    ovftool --verifyOnly, 'euc-unified-access-gateway' vmdk check.
 
-Použití:
+Usage:
     python3 uag_deploy.py --ini uag1.ini
     python3 uag_deploy.py --ini uag1.ini --root-password '...' --admin-password '...'
     python3 uag_deploy.py --ini uag1.ini --no-ssl-verify --dry-run
@@ -52,11 +52,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 def locate_ovftool() -> str | None:
     """
-    Najde ovftool v tomto pořadí:
-      1. portable distribuce ve složce 'ovftool' vedle skriptů
+    Locates ovftool in this order:
+      1. portable distribution in an 'ovftool' folder next to the scripts
          (ovftool\\ovftool.exe / ovftool/ovftool)
-      2. ovftool.exe přímo vedle skriptů
-      3. standardní instalace (Program Files / /usr/bin)
+      2. ovftool.exe directly next to the scripts
+      3. standard installation (Program Files / /usr/bin)
       4. PATH
     """
     import shutil as _shutil
@@ -81,7 +81,7 @@ SETTINGS_MAX = 16 * SETTINGS_CHUNK
 
 def read_ini(path: Path) -> configparser.ConfigParser:
     cp = configparser.ConfigParser(interpolation=None, strict=False)
-    cp.optionxform = str  # zachovat velikost písmen (originál je case-sensitive v zápisu)
+    cp.optionxform = str  # keep key case (the original writes keys case-sensitively)
     try:
         with open(path, encoding="utf-8-sig") as f:
             cp.read_file(f)
@@ -98,7 +98,7 @@ def err(msg: str) -> None:
 
 
 def get(cp, section: str, key: str, default: str = "") -> str:
-    """Case-insensitivní čtení klíče (PowerShell hashtable je case-insensitive)."""
+    """Case-insensitive key lookup (PowerShell hashtables are case-insensitive)."""
     if section not in cp:
         return default
     for k, v in cp[section].items():
@@ -112,7 +112,7 @@ def sec_dict(cp, section: str) -> dict[str, str]:
 
 
 def find_section(cp, name: str) -> str | None:
-    """Najde sekci case-insensitivně (SSLcert vs SSLCert...)."""
+    """Finds a section case-insensitively (SSLcert vs SSLCert...)."""
     for s in cp.sections():
         if s.lower() == name.lower():
             return s
@@ -120,7 +120,7 @@ def find_section(cp, name: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Pomocné převody
+# Helper conversions
 # ---------------------------------------------------------------------------
 
 def to_json_value(v: str):
@@ -130,7 +130,7 @@ def to_json_value(v: str):
 
 
 def sanitize_thumbprints(t: str) -> str:
-    # SanitizeThumbprints: povolené znaky hex, ':', ',', mezera, '=' a sha prefixy
+    # SanitizeThumbprints: allowed chars are hex, ':', ',', space, '=' and sha prefixes
     return re.sub(r"[^0-9a-fA-F:,=\s(sha256)(sha1)]", "", t)
 
 
@@ -143,12 +143,12 @@ def read_pem_file(path: str, what: str, section: str) -> str:
     if idx < 0:
         err(f"Invalid PEM file ({what}) specified in {section}.")
     text = text[idx:]
-    # originál vyžaduje PKCS#1 formát privátního klíče (BEGIN RSA PRIVATE KEY)
+    # the original requires the PKCS#1 private key format (BEGIN RSA PRIVATE KEY)
     if "privkey" in what.lower() or "privatekey" in what.lower():
         if "-----BEGIN RSA PRIVATE KEY-----" not in text:
             err(f"Invalid private key PEM file ({what}) in {section}. It must contain "
-                f"an RSA private key (PKCS#1). Převod z PKCS#8: "
-                f"openssl rsa -in {path} -traditional -out klic_pkcs1.pem")
+                f"an RSA private key (PKCS#1). Convert from PKCS#8 with: "
+                f"openssl rsa -in {path} -traditional -out key_pkcs1.pem")
     return text
 
 
@@ -186,7 +186,7 @@ def get_certificate_wrapper(cp, section_name: str, pfx_password: str | None,
         if pfx_password is None:
             if interactive:
                 pfx_password = getpass.getpass(
-                    f"Heslo k PFX {p.name} [{section}] (Enter = bez hesla): ")
+                    f"Password for PFX {p.name} [{section}] (Enter = no password): ")
             else:
                 pfx_password = ""
         wrapper = {
@@ -202,7 +202,7 @@ def get_certificate_wrapper(cp, section_name: str, pfx_password: str | None,
     return out
 
 
-# Klíče [Horizon], které se NEkopírují 1:1 (soubory / speciální zpracování)
+# [Horizon] keys that are NOT copied 1:1 (files / special handling)
 HORIZON_SKIP = {
     "privatekeypem", "certchainpem", "pfxkeystore", "pfxcertalias",
     "pfxcertspassword", "trustedcert", "keytab",
@@ -210,9 +210,9 @@ HORIZON_SKIP = {
 
 
 def get_edge_view(cp, interactive: bool) -> dict | None:
-    """[Horizon] -> edge služba VIEW. Generická 1:1 kopie klíčů + speciální logika
-    dle GetEdgeServiceSettingsVIEW (strip :443, sanitizace thumbprintů,
-    xmlSigningSwitch default AUTO, XML signing certy z PEM souborů)."""
+    """[Horizon] -> VIEW edge service. Generic 1:1 key copy plus special logic
+    per GetEdgeServiceSettingsVIEW (strip :443, thumbprint sanitization,
+    xmlSigningSwitch default AUTO, XML signing certs from PEM files)."""
     section = find_section(cp, "Horizon")
     if not section:
         return None
@@ -245,7 +245,7 @@ def get_edge_view(cp, interactive: bool) -> dict | None:
         err("xmlSigningSwitch field can be set to AUTO, ON or OFF")
     svc["xmlSigningSwitch"] = xml_sw
 
-    # XML API signing certifikát (PEM varianta)
+    # XML API signing certificate (PEM variant)
     if h.get("certChainPem"):
         if not h.get("privateKeyPem"):
             err("XML API Signing PEM private key file privateKeyPem not specified")
@@ -257,7 +257,7 @@ def get_edge_view(cp, interactive: bool) -> dict | None:
         p = Path(h["pfxKeystore"])
         if not p.is_file():
             err(f"PFX Certificate file not found ({h['pfxKeystore']})")
-        pw = getpass.getpass(f"Heslo k XML signing PFX {p.name}: ") if interactive else ""
+        pw = getpass.getpass(f"Password for the XML signing PFX {p.name}: ") if interactive else ""
         pfx = {"pfxKeystore": base64.b64encode(p.read_bytes()).decode(), "password": pw}
         if h.get("pfxCertAlias"):
             pfx["alias"] = h["pfxCertAlias"]
@@ -268,7 +268,7 @@ def get_edge_view(cp, interactive: bool) -> dict | None:
     if host_entries:
         svc["hostEntries"] = host_entries
 
-    # zbytek klíčů 1:1 (bool konverze), přeskočit už zpracované a soubory
+    # remaining keys 1:1 (bool conversion), skip already-handled and file keys
     handled = {"proxydestinationurl", "proxydestinationurlthumbprints",
                "xmlsigningswitch"} | HORIZON_SKIP
     for k, v in h.items():
@@ -291,7 +291,7 @@ WRP_SKIP = {"trustedcert", "keytab", "metadataxmlfile"}
 
 
 def get_edge_wrps(cp) -> list[dict]:
-    """[WebReverseProxy], [WebReverseProxy1..99] -> WEB_REVERSE_PROXY služby."""
+    """[WebReverseProxy], [WebReverseProxy1..99] -> WEB_REVERSE_PROXY services."""
     out = []
     for i in range(0, 100):
         name = f"WebReverseProxy{i if i else ''}"
@@ -320,7 +320,7 @@ def get_edge_wrps(cp) -> list[dict]:
 
 
 def get_radius_auth(cp, interactive: bool) -> dict | None:
-    """[RADIUSAuth] -> radius-auth. Shared secret v exportu není -> prompt."""
+    """[RADIUSAuth] -> radius-auth. The shared secret is never exported -> prompt."""
     section = find_section(cp, "RADIUSAuth")
     if not section:
         return None
@@ -332,7 +332,7 @@ def get_radius_auth(cp, interactive: bool) -> dict | None:
         auth["sharedSecret"] = secret
     if r.get("radiusSharedSecret_2") or (r.get("hostName_2") and interactive):
         auth["sharedSecret_2"] = r.get("radiusSharedSecret_2") or getpass.getpass(
-            f"RADIUS shared secret pro sekundární server [{section}]: ")
+            f"RADIUS shared secret for the secondary server [{section}]: ")
     for k, v in r.items():
         if k.lower().startswith("radiussharedsecret") or not v:
             continue
@@ -340,7 +340,7 @@ def get_radius_auth(cp, interactive: bool) -> dict | None:
     return auth
 
 
-# systemSettings whitelist z GetSystemSettings ([General] klíče)
+# systemSettings whitelist from GetSystemSettings ([General] keys)
 SYSTEM_KEYS = [
     "headersToBeLogged", "cipherSuites", "outboundCipherSuites", "sslProvider",
     "tlsNamedGroups", "tlsSignatureSchemes", "tls11Enabled", "tls12Enabled",
@@ -375,10 +375,10 @@ def warn_unhandled_sections(cp) -> None:
                  if s.lower() not in KNOWN_SECTIONS
                  and not s.lower().startswith("webreverseproxy")]
     if unhandled:
-        print(f"[!] Upozornění: sekce {unhandled} tento port nezpracovává "
+        print(f"[!] Warning: sections {unhandled} are not handled by this port "
               f"(SecurID, SAML, Kerberos, SNMP, HA, DevicePolicy...). "
-              f"Doporučený postup: nasadit minimální appliance a plnou konfiguraci "
-              f"naimportovat přes REST API (uag_migrate.py import).")
+              f"Recommended approach: deploy a minimal appliance and import the "
+              f"full configuration via the REST API (uag_migrate.py import).")
 
 
 def build_settings_json(cp, pfx_password: str | None, interactive: bool) -> str:
@@ -411,7 +411,7 @@ def build_settings_json(cp, pfx_password: str | None, interactive: bool) -> str:
 
 
 def write_config_file(settings_json: str, ap_name: str, workdir: Path) -> Path:
-    """Ekvivalent GetSettingsJSONProperty + zápis .cfg pro --configFile."""
+    """Equivalent of GetSettingsJSONProperty + writes the .cfg for --configFile."""
     if len(settings_json) > SETTINGS_MAX:
         err("Provided settings exceeds max allowed settings that can be deployed.")
     lines = []
@@ -426,7 +426,7 @@ def write_config_file(settings_json: str, ap_name: str, workdir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# NIC opce (ekvivalent GetNetOptions - 11 kombinací ipMode)
+# NIC options (equivalent of GetNetOptions - 11 ipMode combinations)
 # ---------------------------------------------------------------------------
 
 DHCP_ONLY = {"DHCPV4", "DHCPV4+DHCPV6", "DHCPV4+AUTOV6", "DHCPV6", "AUTOV6"}
@@ -486,11 +486,11 @@ def get_net_options(cp, nic: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Hlavní stavba ovftool příkazu (ekvivalent těla uagdeploy.ps1)
+# Main ovftool command construction (equivalent of the uagdeploy.ps1 body)
 # ---------------------------------------------------------------------------
 
-# Přímé OVF properties čtené z [General] (název INI klíče == název property,
-# přidávají se jen pokud jsou vyplněné) - přesně dle uagdeploy.ps1
+# Direct OVF properties read from [General] (INI key name == property name,
+# added only when non-empty) - exactly per uagdeploy.ps1
 PASSTHROUGH_PROPS = [
     "rootPasswordExpirationDays", "passwordPolicyMinLen", "passwordPolicyMinClass",
     "passwordPolicyDifok", "passwordPolicyUnlockTime", "passwordPolicyFailedLockout",
@@ -504,7 +504,7 @@ PASSTHROUGH_PROPS = [
     "adminMaxConcurrentSessions", "rootSessionIdleTimeoutSeconds", "gatewaySpec",
 ]
 
-# INI klíč -> jiný název OVF property
+# INI key -> differently named OVF property
 RENAMED_PROPS = {
     "adminPasswordPolicyMinLen": "adminPasswordPolicyMinLen",
     "adminPasswordPolicyUnlockTime": "adminPasswordPolicyUnlockTime",
@@ -580,7 +580,7 @@ def build_cmd(cp, ovftool: str, root_pwd: str, admin_pwd: str, ceip: str,
     cmd.append(f"--deploymentOption={dep}")
 
     if g("dns"):
-        cmd.append(f"--prop:DNS={g('dns')}")   # velké DNS - jako v originálu!
+        cmd.append(f"--prop:DNS={g('dns')}")   # uppercase DNS - as in the original!
 
     for key in PASSTHROUGH_PROPS:
         v = g(key)
@@ -635,7 +635,7 @@ def redact(cmd: list[str]) -> str:
             out.append(a.split("=", 1)[0] + "=********")
         elif a.startswith("vi://") and "@" in a:
             scheme, rest = a.split("://", 1)
-            creds, tail = rest.rsplit("@", 1)   # username může obsahovat @
+            creds, tail = rest.rsplit("@", 1)   # the username itself may contain @
             if ":" in creds:
                 out.append(f"{scheme}://{creds.rsplit(':', 1)[0]}:********@{tail}")
             else:
@@ -651,29 +651,29 @@ def redact(cmd: list[str]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="Deploy Omnissa UAG do vSphere (Python port uagdeploy.ps1 25.12.1)")
-    ap.add_argument("--ini", default="uag.ini", help="INI soubor (default uag.ini)")
+        description="Deploy Omnissa UAG to vSphere (Python port of uagdeploy.ps1 25.12.1)")
+    ap.add_argument("--ini", default="uag.ini", help="INI file (default uag.ini)")
     ap.add_argument("--ovftool", default=None)
     ap.add_argument("--root-password", dest="root_pwd", default=None)
     ap.add_argument("--admin-password", dest="admin_pwd", default=None)
     ap.add_argument("--ceip-enabled", dest="ceip", default=None,
                     help="yes/no (default: prompt)")
     ap.add_argument("--pfx-password", default=None,
-                    help="Heslo k PFX z [SSLcert]/[SSLcertAdmin]")
+                    help="Password for the PFX from [SSLcert]/[SSLcertAdmin]")
     ap.add_argument("--vcenter-password", default=None,
-                    help="Doplní heslo do target= vi:// URL, pokud chybí")
+                    help="Injects the password into the target= vi:// URL when missing")
     ap.add_argument("--no-ssl-verify", action="store_true",
-                    help="ekvivalent -noSSLVerify")
+                    help="equivalent of -noSSLVerify")
     ap.add_argument("--disable-verification", action="store_true",
-                    help="ekvivalent -disableVerification")
+                    help="equivalent of -disableVerification")
     ap.add_argument("--non-interactive", action="store_true",
-                    help="žádné prompty (chybějící secrety zůstanou prázdné)")
+                    help="no prompts (missing secrets stay empty)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
     print("Unified Access Gateway (UAG) virtual appliance deployment script (Python port)")
-    print("Pozn.: Pokud je INI exportované z UAG a měnili jste URL/IP adresy, "
-          "zkontrolujte/odstraňte OriginHeaderDetails[index] v INI "
+    print("Note: If this INI was exported from a UAG and any URL/IP addresses "
+          "were changed, review/remove OriginHeaderDetails[index] in the INI "
           "(Admin UI -> Horizon Settings -> Allowed Origins).")
 
     cp = read_ini(Path(args.ini))
@@ -693,31 +693,31 @@ def main() -> int:
     interactive = not args.non_interactive
 
     root_pwd = args.root_pwd or (getpass.getpass(
-        f"Root heslo pro {ap_name} (min. 8 zn., velké+malé+číslice+symbol): ")
+        f"Root password for {ap_name} (min 8 chars, upper+lower+digit+symbol): ")
         if interactive else "")
     if not root_pwd:
         err("root password is required")
     admin_pwd = args.admin_pwd
     if admin_pwd is None and interactive:
         admin_pwd = getpass.getpass(
-            f"Admin heslo pro {ap_name} (prázdné = bez Admin UI/REST API): ")
+            f"Admin password for {ap_name} (empty = no Admin UI/REST API): ")
     admin_pwd = admin_pwd or ""
     ceip = args.ceip
     if ceip is None:
         ceip = (input("Join CEIP (Customer Experience Improvement Program)? yes/no [no]: ")
                 if interactive else "no") or "no"
 
-    # doplnění hesla do vi:// target
+    # inject the password into the vi:// target
     target = get(cp, "General", "target")
     if args.vcenter_password and "@" in target:
         scheme, rest = target.split("://", 1)
-        creds, tail = rest.rsplit("@", 1)   # username může obsahovat @
+        creds, tail = rest.rsplit("@", 1)   # the username itself may contain @
         if ":" not in creds or creds.rindex(":") < creds.rfind("@"):
-            # heslo ještě není uvedeno -> doplnit
+            # password not present yet -> inject it
             enc = urllib.parse.quote(args.vcenter_password, safe="")
             cp["General"]["target"] = f"{scheme}://{creds}:{enc}@{tail}"
 
-    # ověření OVA (jako v originálu, přeskočeno u dry-run)
+    # OVA verification (as in the original, skipped on dry-run)
     if not args.dry_run:
         verify_source(ovftool, get(cp, "General", "source"), args.no_ssl_verify)
 
@@ -731,9 +731,9 @@ def main() -> int:
     cmd = build_cmd(cp, ovftool, root_pwd, admin_pwd, ceip, cfg_file, log_file,
                     args.no_ssl_verify, args.disable_verification)
 
-    print("\n== ovftool příkaz ==")
+    print("\n== ovftool command ==")
     print(redact(cmd))
-    print(f"\n(settingsJSON: {len(settings_json)} znaků -> {cfg_file})")
+    print(f"\n(settingsJSON: {len(settings_json)} chars -> {cfg_file})")
 
     try:
         if args.dry_run:
@@ -749,7 +749,7 @@ def main() -> int:
                   f"in the log file {log_file}")
         return proc.returncode
     finally:
-        cfg_file.unlink(missing_ok=True)   # cfg obsahuje certy/secrety -> smazat vždy
+        cfg_file.unlink(missing_ok=True)   # the cfg contains certs/secrets -> always delete
 
 
 if __name__ == "__main__":

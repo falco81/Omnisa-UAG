@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-uag_migrate.py - Orchestrace migrace Omnissa UAG na novou verzi
-(side-by-side "deploy & migrate", protože UAG in-place upgrade nepodporuje).
+uag_migrate.py - Orchestrates an Omnissa UAG migration to a new version
+(side-by-side "deploy & migrate", because UAG does not support in-place
+upgrades).
 
-Podpříkazy:
-    export    - stáhne konfiguraci ze staré UAG (JSON) a uloží na disk
-    deploy    - nasadí novou UAG (volá uag_deploy.py / ovftool s INI)
-    import    - naimportuje JSON konfiguraci do nové UAG + doplní secrety/cert
-    health    - ověří dostupnost Admin API a stav edge služeb
-    quiesce   - přepne starou UAG do quiesce módu (dobíhání sessions)
-    migrate   - celý řetězec: export -> deploy -> import -> health -> quiesce
+Subcommands:
+    export    - downloads the configuration from the old UAG (JSON)
+    deploy    - deploys a new UAG (calls uag_deploy.py / ovftool with an INI)
+    import    - imports the JSON configuration into the new UAG + secrets/cert
+    health    - checks Admin API availability and edge service status
+    quiesce   - puts the old UAG into quiesce mode (sessions drain)
+    migrate   - the whole chain: export -> deploy -> import -> health -> quiesce
 
-Příklady:
+Examples:
     python3 uag_migrate.py export  --host uag-old.firma.cz --out uag_settings.json
     python3 uag_migrate.py deploy  --ini uag-new.ini
     python3 uag_migrate.py import  --host 10.0.0.50 --settings uag_settings.json \
@@ -19,10 +20,11 @@ Příklady:
     python3 uag_migrate.py migrate --old-host uag-old.firma.cz --ini uag-new.ini \
         --new-host 10.0.0.50 --cert-pem cert_chain.pem --key-pem key.pem
 
-DŮLEŽITÉ (omezení exportu UAG):
-    Export JSON NEOBSAHUJE: hesla, RADIUS/SAML shared secrets, TLS certifikát
-    (PFX/PEM), keytab soubory. Ty je nutné dodat znovu - skript na chybějící
-    položky upozorní a certifikát umí nahrát přes REST API.
+IMPORTANT (UAG export limitation):
+    The JSON export DOES NOT contain: passwords, RADIUS/SAML shared secrets,
+    the TLS certificate (PFX/PEM), keytab files. These must be supplied again -
+    the script warns about missing items and can upload the certificate via
+    the REST API.
 """
 
 from __future__ import annotations
@@ -42,15 +44,15 @@ SECRET_HINTS = (
     "privatekey", "keytab", "clientsecret",
 )
 
-# Klíče, které heuristice padnou do sítě, ale secrety NEJSOU (jen UI texty
-# a přepínače) - např. radiusCustomPassphraseHint je "Login page passphrase
-# hint": text zobrazený uživateli v Horizon Clientu, žádný citlivý údaj.
+# Keys the heuristic would match but which are NOT secrets (UI texts and
+# toggles) - e.g. radiusCustomPassphraseHint is the "Login page passphrase
+# hint": text shown to end users in the Horizon Client, not sensitive.
 NOT_SECRETS = ("hint", "label", "expiration", "policy", "enabled",
                "protected", "required")
 
 
 def find_missing_secrets(settings: dict) -> list[str]:
-    """Projde exportovaný JSON a najde klíče, které vypadají na vyprázdněné secrety."""
+    """Walks the exported JSON and finds keys that look like emptied secrets."""
     hits: list[str] = []
 
     def walk(node, path=""):
@@ -72,34 +74,34 @@ def find_missing_secrets(settings: dict) -> list[str]:
 
 
 def make_client(host: str, user: str, password: str | None) -> UagClient:
-    pw = password or getpass.getpass(f"Admin heslo pro {host}: ")
+    pw = password or getpass.getpass(f"Admin password for {host}: ")
     return UagClient(host=host, admin_user=user, admin_password=pw)
 
 
 # ----------------------------------------------------------------- commands
 def cmd_export(args) -> int:
     c = make_client(args.host, args.user, args.password)
-    print(f"[..] Exportuji konfiguraci z {args.host} ...")
+    print(f"[..] Exporting configuration from {args.host} ...")
     settings = c.export_settings()
     out = Path(args.out or f"uag_settings_{args.host}_{datetime.now():%Y%m%d_%H%M%S}.json")
     save_json(str(out), settings)
-    print(f"[OK] Uloženo: {out}")
+    print(f"[OK] Saved: {out}")
 
     missing = find_missing_secrets(settings)
     if missing:
-        print("\n[!] Export neobsahuje tyto secrety - při importu je nutné doplnit:")
+        print("\n[!] The export does not contain these secrets - supply them for the import:")
         for m in missing:
             print(f"    - {m}")
-    print("[!] TLS certifikát a keytaby export nikdy neobsahuje - připravte si PEM/PFX/keytab.")
+    print("[!] The export never contains the TLS certificate or keytabs - have your PEM/PFX/keytab ready.")
     return 0
 
 
 def apply_ini_overrides(ini_path: str, sets: list[str] | None) -> str:
     """
-    Vytvoří runtime kopii INI s přepisy z --set Sekce.klíč=hodnota.
-    Umožňuje znovupoužít jednu šablonu pro více UAG / migrací
-    (typicky --set General.name=... --set General.ip0=... --set General.source=...).
-    Vrací cestu k runtime INI (originál zůstává netknutý).
+    Creates a runtime copy of the INI with --set Section.key=value overrides.
+    Lets one template be reused for multiple UAGs / migrations
+    (typically --set General.name=... --set General.ip0=... --set General.source=...).
+    Returns the path to the runtime INI (the original stays untouched).
     """
     if not sets:
         return ini_path
@@ -110,7 +112,7 @@ def apply_ini_overrides(ini_path: str, sets: list[str] | None) -> str:
         cp.read_file(f)
     for item in sets:
         if "=" not in item or "." not in item.split("=", 1)[0]:
-            sys.exit(f"CHYBA: --set očekává formát Sekce.klíč=hodnota (dostal: {item})")
+            sys.exit(f"ERROR: --set expects the format Section.key=value (got: {item})")
         key_path, value = item.split("=", 1)
         section, key = key_path.split(".", 1)
         if section not in cp:
@@ -119,31 +121,31 @@ def apply_ini_overrides(ini_path: str, sets: list[str] | None) -> str:
     runtime = Path(ini_path).with_suffix(".runtime.ini")
     with open(runtime, "w", encoding="utf-8") as f:
         cp.write(f)
-    print(f"[OK] Runtime INI s přepisy: {runtime}")
+    print(f"[OK] Runtime INI with overrides: {runtime}")
     return str(runtime)
 
 
 def preflight(ini_path: str, old_host: str | None, old_client_factory=None,
               cert_pem: str | None = None, key_pem: str | None = None) -> list[str]:
     """
-    Kontroly PŘED zahájením migrace/deploye, ať nic nespadne v půlce:
-      - ovftool nalezen, INI parsovatelné, OVA soubor existuje a vypadá jako UAG,
-      - certifikáty (INI [SSLCert] i --cert-pem/--key-pem) existují,
-      - PEM klíč je PKCS#1 (vyžadováno deploy skriptem),
-      - stará UAG odpovídá na Admin API (jen u migrace).
-    Vrací seznam chyb (prázdný = OK).
+    Checks BEFORE the migration/deploy starts so nothing fails halfway:
+      - ovftool found, INI parseable, the OVA file exists and looks like a UAG,
+      - certificates (INI [SSLCert] and --cert-pem/--key-pem) exist,
+      - the PEM key is PKCS#1 (required by the deploy script),
+      - the old UAG responds on the Admin API (migration only).
+    Returns a list of problems (empty = OK).
     """
     import configparser
     problems: list[str] = []
 
-    # ovftool (portable ./ovftool/ vedle skriptů, instalace, PATH)
+    # ovftool (portable ./ovftool/ next to the scripts, installation, PATH)
     try:
         import uag_deploy as _ud
         if not _ud.locate_ovftool():
-            problems.append("ovftool nenalezen (portable './ovftool/' vedle "
-                            "skriptů, Program Files ani PATH)")
+            problems.append("ovftool not found (portable './ovftool/' next to "
+                            "the scripts, Program Files, or PATH)")
     except ImportError:
-        problems.append("uag_deploy.py chybí vedle uag_migrate.py")
+        problems.append("uag_deploy.py is missing next to uag_migrate.py")
 
     # INI + OVA
     cp = configparser.ConfigParser(interpolation=None, strict=False)
@@ -152,45 +154,45 @@ def preflight(ini_path: str, old_host: str | None, old_client_factory=None,
         with open(ini_path, encoding="utf-8-sig") as f:
             cp.read_file(f)
     except OSError:
-        problems.append(f"INI soubor {ini_path} nelze načíst")
+        problems.append(f"cannot read the INI file {ini_path}")
         cp = None
     if cp:
         source = cp.get("General", "source", fallback="").strip()
         if not source:
-            problems.append("[General] source= chybí v INI")
+            problems.append("[General] source= is missing in the INI")
         elif not Path(source).is_file():
-            problems.append(f"OVA soubor neexistuje: {source}")
+            problems.append(f"OVA file does not exist: {source}")
         elif "euc-unified-access-gateway" not in Path(source).name:
-            problems.append(f"OVA nevypadá jako UAG image: {Path(source).name}")
+            problems.append(f"OVA does not look like a UAG image: {Path(source).name}")
         if not cp.get("General", "ds", fallback="").strip():
-            problems.append("[General] ds= chybí v INI")
+            problems.append("[General] ds= is missing in the INI")
         if not cp.get("General", "target", fallback="").strip():
-            problems.append("[General] target= chybí v INI")
-        # certifikáty z INI
+            problems.append("[General] target= is missing in the INI")
+        # certificates referenced by the INI
         for section in ("SSLCert", "SSLcert", "SSLCertAdmin", "SSLcertAdmin"):
             if cp.has_section(section):
                 for key in ("pfxCerts", "pemCerts", "pemPrivKey"):
                     v = cp.get(section, key, fallback="").strip()
                     if v and not Path(v).is_file():
-                        problems.append(f"[{section}] {key}={v} - soubor neexistuje")
+                        problems.append(f"[{section}] {key}={v} - file does not exist")
                 pem_key = cp.get(section, "pemPrivKey", fallback="").strip()
                 if pem_key and Path(pem_key).is_file():
                     if "BEGIN RSA PRIVATE KEY" not in Path(pem_key).read_text(errors="replace"):
                         problems.append(
-                            f"[{section}] pemPrivKey není PKCS#1 - převod: "
-                            f"openssl rsa -in {pem_key} -traditional -out klic_pkcs1.pem")
+                            f"[{section}] pemPrivKey is not PKCS#1 - convert with: "
+                            f"openssl rsa -in {pem_key} -traditional -out key_pkcs1.pem")
 
-    # certifikáty pro REST import
+    # certificates for the REST import
     for label, path in (("--cert-pem", cert_pem), ("--key-pem", key_pem)):
         if path and not Path(path).is_file():
-            problems.append(f"{label} {path} - soubor neexistuje")
+            problems.append(f"{label} {path} - file does not exist")
 
-    # stará UAG dostupná
+    # the old UAG is reachable
     if old_host and old_client_factory:
         try:
             old_client_factory().get_system_health()
         except Exception as e:
-            problems.append(f"Stará UAG {old_host} neodpovídá na Admin API: {e}")
+            problems.append(f"Old UAG {old_host} does not respond on the Admin API: {e}")
 
     return problems
 
@@ -199,11 +201,11 @@ def cmd_deploy(args) -> int:
     ini = apply_ini_overrides(args.ini, getattr(args, "set", None))
     problems = preflight(ini, None)
     if problems:
-        print("[!] Preflight kontrola selhala:")
+        print("[!] Preflight check failed:")
         for p in problems:
             print(f"    - {p}")
         if not getattr(args, "force", False):
-            print("    Opravte, nebo spusťte s --force.")
+            print("    Fix the issues, or run with --force.")
             return 2
     cmd = [sys.executable, str(Path(__file__).parent / "uag_deploy.py"),
            "--ini", ini, "--ceip-enabled", "no"]
@@ -224,12 +226,12 @@ def cmd_import(args) -> int:
     c = make_client(args.host, args.user, args.password)
 
     if not c.wait_until_ready(max_wait_s=args.wait):
-        print(f"CHYBA: Admin API na {args.host} není dostupné.", file=sys.stderr)
+        print(f"ERROR: the Admin API on {args.host} is not reachable.", file=sys.stderr)
         return 2
 
     settings = load_json(args.settings)
 
-    # volitelné patchování secretů z doprovodného souboru {"cesta.klíč": "hodnota"}
+    # optional secret patching from a companion file {"path.key": "value"}
     if args.secrets:
         patches = load_json(args.secrets)
         applied = 0
@@ -248,37 +250,37 @@ def cmd_import(args) -> int:
                     patch(item, f"{path}[{i}]")
 
         patch(settings)
-        print(f"[OK] Doplněno {applied} secretů ze souboru {args.secrets}")
+        print(f"[OK] Patched {applied} secrets from {args.secrets}")
 
     missing = find_missing_secrets(settings)
     if missing and not args.force:
-        print("[!] V konfiguraci zůstávají prázdné secrety:")
+        print("[!] The configuration still contains empty secrets:")
         for m in missing:
             print(f"    - {m}")
-        print("    Pokračujte s --force, nebo je doplňte přes --secrets soubor.")
+        print("    Continue with --force, or supply them via a --secrets file.")
         return 3
 
-    print(f"[..] Importuji konfiguraci do {args.host} ...")
+    print(f"[..] Importing configuration into {args.host} ...")
     try:
         c.import_settings(settings)
     except UagApiError as e:
-        print(f"CHYBA importu: {e}", file=sys.stderr)
-        print("Tip: zkontrolujte SHA-1 vs SHA-256 thumbprinty a zastaralé cipher suites v JSON.",
+        print(f"Import ERROR: {e}", file=sys.stderr)
+        print("Tip: check SHA-1 vs SHA-256 thumbprints and legacy cipher suites in the JSON.",
               file=sys.stderr)
         return 4
-    print("[OK] Konfigurace naimportována.")
+    print("[OK] Configuration imported.")
 
     if args.cert_pem and args.key_pem:
-        print("[..] Nahrávám TLS certifikát ...")
+        print("[..] Uploading the TLS certificate ...")
         c.upload_tls_cert_pem(load_pem(args.key_pem), load_pem(args.cert_pem),
                               interface=args.cert_interface)
-        print("[OK] Certifikát nahrán.")
+        print("[OK] Certificate uploaded.")
     else:
-        print("[!] TLS certifikát nebyl nahrán (chybí --cert-pem/--key-pem) - nutno doplnit ručně.")
+        print("[!] TLS certificate was not uploaded (missing --cert-pem/--key-pem) - upload it manually.")
 
     if c.wait_for_edge_services_green(max_wait_s=args.wait):
         return 0
-    print("[!] Edge služby nejsou zelené - zkontrolujte Admin UI.", file=sys.stderr)
+    print("[!] Edge services are not green - check the Admin UI.", file=sys.stderr)
     return 5
 
 
@@ -289,27 +291,27 @@ def cmd_health(args) -> int:
         return 2
     stats = c.get_edge_status()
     if isinstance(stats, str):
-        print(stats)   # /monitor/stats vrací XML
+        print(stats)   # /monitor/stats returns XML
     else:
         print(json.dumps(stats, indent=2, ensure_ascii=False))
-    print("\nZelené:", "ANO" if c.edge_status_is_green(stats) else "NE")
+    print("\nGreen:", "YES" if c.edge_status_is_green(stats) else "NO")
     return 0
 
 
 def cmd_quiesce(args) -> int:
     c = make_client(args.host, args.user, args.password)
     c.set_quiesce_mode(True)
-    print(f"[OK] {args.host} je v quiesce módu - nové session nepřijímá, "
-          f"stávající dobíhají. Po vyprázdnění VM vypněte/smažte.")
+    print(f"[OK] {args.host} is in quiesce mode - it accepts no new sessions, "
+          f"existing ones drain. Power off/delete the VM once drained.")
     return 0
 
 
 def cmd_migrate(args) -> int:
-    """Celý řetězec migrace: preflight -> export -> deploy -> import -> health -> quiesce."""
-    old_pw = args.old_password or getpass.getpass(f"Admin heslo STARÉ UAG {args.old_host}: ")
+    """The whole migration chain: preflight -> export -> deploy -> import -> health -> quiesce."""
+    old_pw = args.old_password or getpass.getpass(f"Admin password of the OLD UAG {args.old_host}: ")
 
-    # 0) Preflight - ověřit VŠECHNO před prvním krokem (INI, OVA, ovftool,
-    #    certifikáty, dostupnost staré UAG), ať migrace nespadne v půlce.
+    # 0) Preflight - verify EVERYTHING before the first step (INI, OVA,
+    #    ovftool, certificates, old UAG reachability) so nothing fails halfway.
     ini = apply_ini_overrides(args.ini, getattr(args, "set", None))
     problems = preflight(
         ini, args.old_host,
@@ -317,19 +319,19 @@ def cmd_migrate(args) -> int:
                                              admin_password=old_pw),
         cert_pem=args.cert_pem, key_pem=args.key_pem)
     if problems:
-        print("[!] Preflight kontrola selhala:")
+        print("[!] Preflight check failed:")
         for p in problems:
             print(f"    - {p}")
         if not args.force:
-            print("    Opravte, nebo spusťte s --force.")
+            print("    Fix the issues, or run with --force.")
             return 2
     else:
-        print("[OK] Preflight: ovftool, OVA, INI, certifikáty i stará UAG v pořádku.")
+        print("[OK] Preflight: ovftool, OVA, INI, certificates and the old UAG are all fine.")
 
     new_pw = args.new_password or getpass.getpass(
-        "Admin heslo NOVÉ UAG (bude nastaveno při deployi): ")
+        "Admin password of the NEW UAG (will be set at deploy time): ")
 
-    # Bezpečnostní pojistka: ovftool s --overwrite smaže VM se stejným jménem!
+    # Safety guard: ovftool with --overwrite deletes a VM with the same name!
     import configparser
     cpi = configparser.ConfigParser(interpolation=None, strict=False)
     cpi.optionxform = str
@@ -337,14 +339,14 @@ def cmd_migrate(args) -> int:
         cpi.read_file(f)
     new_vm_name = cpi.get("General", "name", fallback="")
     if new_vm_name and new_vm_name.lower() in args.old_host.lower():
-        print(f"[!] VAROVÁNÍ: jméno nové VM '{new_vm_name}' se shoduje se starou UAG "
-              f"({args.old_host}). ovftool --overwrite by starou VM SMAZAL!")
+        print(f"[!] WARNING: the new VM name '{new_vm_name}' matches the old UAG "
+              f"({args.old_host}). ovftool --overwrite would DELETE the old VM!")
         if not args.force:
-            print("    Změňte [General] name= (např. --set General.name=...-NEW), "
-                  "nebo potvrďte --force.")
+            print("    Change [General] name= (e.g. --set General.name=...-NEW), "
+                  "or confirm with --force.")
             return 2
 
-    # 1) Export ze staré
+    # 1) Export from the old appliance
     ns = argparse.Namespace(host=args.old_host, user=args.user, password=old_pw,
                             out=args.settings_out)
     if cmd_export(ns) != 0:
@@ -352,26 +354,26 @@ def cmd_migrate(args) -> int:
     settings_file = args.settings_out or sorted(
         Path(".").glob(f"uag_settings_{args.old_host}_*.json"))[-1]
 
-    # 2) Deploy nové (INI může obsahovat [SSLCert] -> cert se nasadí už teď)
-    ns = argparse.Namespace(ini=ini, set=None, force=True,  # preflight už proběhl
+    # 2) Deploy the new one (the INI may contain [SSLCert] -> cert deployed now)
+    ns = argparse.Namespace(ini=ini, set=None, force=True,  # preflight already ran
                             root_password=args.root_password,
                             admin_password=new_pw,
                             vcenter_password=args.vcenter_password,
                             pfx_password=args.pfx_password,
                             no_ssl_verify=args.no_ssl_verify)
     if cmd_deploy(ns) != 0:
-        print("CHYBA: deploy selhal, migrace zastavena. Stará UAG je netknutá.",
+        print("ERROR: deploy failed, migration stopped. The old UAG is untouched.",
               file=sys.stderr)
         return 2
 
-    # 3) Import do nové. Pokud cert šel už při deployi přes [SSLCert],
-    #    --cert-pem/--key-pem nejsou potřeba.
+    # 3) Import into the new one. If the cert went in at deploy time via
+    #    [SSLCert], --cert-pem/--key-pem are not needed.
     cert_in_ini = bool(cpi.get("SSLCert", "pfxCerts", fallback="")
                        or cpi.get("SSLCert", "pemCerts", fallback="")
                        or cpi.get("SSLcert", "pfxCerts", fallback="")
                        or cpi.get("SSLcert", "pemCerts", fallback=""))
     if cert_in_ini and not (args.cert_pem and args.key_pem):
-        print("[i] TLS certifikát byl nasazen už při deployi ([SSLCert] v INI).")
+        print("[i] The TLS certificate was deployed at deploy time ([SSLCert] in the INI).")
     ns = argparse.Namespace(host=args.new_host, user=args.user, password=new_pw,
                             settings=str(settings_file), secrets=args.secrets,
                             cert_pem=args.cert_pem, key_pem=args.key_pem,
@@ -381,21 +383,21 @@ def cmd_migrate(args) -> int:
     if rc != 0:
         return rc
 
-    # 4) Quiesce staré (volitelně)
+    # 4) Quiesce the old one (optional)
     if args.quiesce_old:
         ns = argparse.Namespace(host=args.old_host, user=args.user, password=old_pw)
         cmd_quiesce(ns)
 
-    print("\n[HOTOVO] Migrace dokončena. Další kroky:")
-    print("  1. Otestujte přihlášení klientů přes novou UAG (Blast/PCoIP/tunnel).")
-    print("  2. Přepněte load balancer / DNS na novou UAG.")
-    print("  3. Po vyprázdnění sessions starou UAG vypněte a smažte.")
+    print("\n[DONE] Migration finished. Next steps:")
+    print("  1. Test client logins through the new UAG (Blast/PCoIP/tunnel).")
+    print("  2. Switch the load balancer / DNS over to the new UAG.")
+    print("  3. Once sessions have drained, power off and delete the old UAG.")
     return 0
 
 
 # --------------------------------------------------------------------- CLI
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Migrace Omnissa UAG na novou verzi")
+    ap = argparse.ArgumentParser(description="Omnissa UAG migration to a new version")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p, host_flag="--host"):
@@ -403,60 +405,60 @@ def main() -> int:
         p.add_argument("--user", default="admin")
         p.add_argument("--password", default=None)
 
-    p = sub.add_parser("export", help="Export konfigurace ze staré UAG")
+    p = sub.add_parser("export", help="Export the configuration from the old UAG")
     common(p)
     p.add_argument("--out", default=None)
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("deploy", help="Deploy nové UAG z INI (s preflight kontrolou)")
+    p = sub.add_parser("deploy", help="Deploy a new UAG from an INI (with preflight check)")
     p.add_argument("--ini", required=True)
-    p.add_argument("--set", action="append", metavar="Sekce.klíč=hodnota",
-                   help="Přepis INI hodnoty, lze opakovat "
-                        "(např. --set General.name=UAG-02 --set General.ip0=10.0.0.51)")
+    p.add_argument("--set", action="append", metavar="Section.key=value",
+                   help="Override an INI value, repeatable "
+                        "(e.g. --set General.name=UAG-02 --set General.ip0=10.0.0.51)")
     p.add_argument("--root-password", default=None)
     p.add_argument("--admin-password", default=None)
     p.add_argument("--vcenter-password", default=None)
     p.add_argument("--pfx-password", default=None,
-                   help="Heslo k PFX z [SSLCert] v INI")
+                   help="Password for the PFX from [SSLCert] in the INI")
     p.add_argument("--no-ssl-verify", action="store_true")
     p.add_argument("--force", action="store_true",
-                   help="Pokračovat i přes chyby preflight kontroly")
+                   help="Continue despite preflight check failures")
     p.set_defaults(func=cmd_deploy)
 
-    p = sub.add_parser("import", help="Import konfigurace do nové UAG")
+    p = sub.add_parser("import", help="Import the configuration into the new UAG")
     common(p)
-    p.add_argument("--settings", required=True, help="JSON z exportu")
-    p.add_argument("--secrets", default=None, help="JSON s doplněnými secrety")
-    p.add_argument("--cert-pem", default=None, help="PEM řetěz certifikátů")
-    p.add_argument("--key-pem", default=None, help="PEM privátní klíč")
+    p.add_argument("--settings", required=True, help="JSON from the export")
+    p.add_argument("--secrets", default=None, help="JSON file with the secrets filled in")
+    p.add_argument("--cert-pem", default=None, help="PEM certificate chain")
+    p.add_argument("--key-pem", default=None, help="PEM private key")
     p.add_argument("--cert-interface", default="internet",
                    choices=["internet", "admin", "internetAndAdmin"])
     p.add_argument("--force", action="store_true")
     p.add_argument("--wait", type=int, default=600)
     p.set_defaults(func=cmd_import)
 
-    p = sub.add_parser("health", help="Stav UAG")
+    p = sub.add_parser("health", help="UAG health status")
     common(p)
     p.set_defaults(func=cmd_health)
 
-    p = sub.add_parser("quiesce", help="Quiesce mód staré UAG")
+    p = sub.add_parser("quiesce", help="Put the old UAG into quiesce mode")
     common(p)
     p.set_defaults(func=cmd_quiesce)
 
-    p = sub.add_parser("migrate", help="Kompletní migrace old -> new")
+    p = sub.add_parser("migrate", help="Complete old -> new migration")
     p.add_argument("--old-host", required=True)
-    p.add_argument("--new-host", required=True, help="IP nové UAG (ip0 z INI)")
+    p.add_argument("--new-host", required=True, help="IP of the new UAG (ip0 from the INI)")
     p.add_argument("--ini", required=True)
-    p.add_argument("--set", action="append", metavar="Sekce.klíč=hodnota",
-                   help="Přepis INI hodnoty, lze opakovat "
-                        "(např. --set General.name=UAG-02-NEW --set SSLCert.pfxCerts=./uag.pfx)")
+    p.add_argument("--set", action="append", metavar="Section.key=value",
+                   help="Override an INI value, repeatable "
+                        "(e.g. --set General.name=UAG-02-NEW --set SSLCert.pfxCerts=./uag.pfx)")
     p.add_argument("--user", default="admin")
     p.add_argument("--old-password", default=None)
     p.add_argument("--new-password", default=None)
     p.add_argument("--root-password", default=None)
     p.add_argument("--vcenter-password", default=None)
     p.add_argument("--pfx-password", default=None,
-                   help="Heslo k PFX z [SSLCert] v INI")
+                   help="Password for the PFX from [SSLCert] in the INI")
     p.add_argument("--no-ssl-verify", action="store_true")
     p.add_argument("--settings-out", default=None)
     p.add_argument("--secrets", default=None)
